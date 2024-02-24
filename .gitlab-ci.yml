@@ -1,0 +1,137 @@
+image:
+  name: hashicorp/terraform:1.6
+  entrypoint:
+    - "/usr/bin/env"
+    - "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+variables:
+  TF_ADDRESS: "https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/terraform/state/default-terraform.tfstate"
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+#cache:
+#  paths:
+#    - infrastructure/.terraform
+
+before_script:
+  - apk add --update git curl bash aws-cli jq
+  - cd ./infrastructure
+  - rm -rf .terraform
+  - terraform --version
+  - terraform init
+    -backend-config=address=${TF_ADDRESS}
+    -backend-config=lock_address=${TF_ADDRESS}/lock
+    -backend-config=unlock_address=${TF_ADDRESS}/lock
+    -backend-config=username=${TF_USERNAME}
+    -backend-config=password=${TF_PASSWORD}
+    -backend-config=lock_method=POST
+    -backend-config=unlock_method=DELETE
+    -backend-config=retry_wait_min=5
+
+stages:
+  - credential_check
+  - validate
+  - plan
+  - apply
+  - destroy
+  - notification
+
+check_credentials:
+  stage: credential_check
+  image: alpine:latest
+  before_script: []
+  script:
+    - apk add --update git curl bash aws-cli jq
+    - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+    - aws configure set default.region $AWS_DEFAULT_REGION
+    - |
+      if ! aws sts get-caller-identity; then
+        echo "AWS credentials check failed. Exiting pipeline."
+        exit 1
+      fi
+
+validate:
+  stage: validate
+  script:
+    - terraform validate
+  dependencies:
+    - check_credentials
+
+plan:
+  stage: plan
+  script:
+    - |
+      echo "### Running terraform plan..."
+      plan_output=$(terraform plan -input=false)
+      echo "$plan_output"
+      if echo "$plan_output" | grep -q "No changes"; then
+        echo "No changes detected. Exiting pipeline."
+        exit 0
+      else
+        echo "Changes detected. Proceeding with apply..."
+        terraform plan -input=false -out default.tfplan
+      fi
+  dependencies:
+    - validate
+  artifacts:
+    paths:
+      - "**/*.tfplan"
+      - "**/.terraform.lock.hcl"
+
+apply:
+  stage: apply
+  script:
+    - if [ -f default.tfplan ]; then terraform apply -auto-approve -input=false default.tfplan; else echo "No plan file found. Skipping apply."; fi
+  dependencies:
+    - plan
+  artifacts:
+    paths:
+      - "**/*.tfplan"
+      - "**/.terraform.lock.hcl"
+
+destroy:
+  stage: destroy
+  script:
+    - echo "### Destroying all the terraform resources except for the database"
+    - terraform destroy -target="aws_ecs_cluster.ecs_cluster" -target="aws_ecs_task_definition.frontend" -target="aws_ecs_task_definition.dotnet_api" -target="aws_acm_certificate.cert" -target="aws_lb.ecs_alb" -target="aws_lb_target_group.ecs_target_group" -target="aws_lb_target_group.ecs_target_group_backend" -target="aws_lb.ecs_alb_backend" -auto-approve
+  dependencies:
+    - apply
+  when: manual
+
+destroy all:
+  stage: destroy
+  script:
+    - echo "### Destroying all the terraform resources"
+    - terraform destroy -auto-approve
+  dependencies:
+    - apply
+  when: manual
+
+success_notification:
+  stage: notification
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache --upgrade bash
+    - apk add --update git curl
+  script:
+    - wget https://raw.githubusercontent.com/DiscordHooks/gitlab-ci-discord-webhook/master/send.sh
+    - chmod +x send.sh
+    - ls
+    - ./send.sh success $WEBHOOK_URL
+  when: on_success
+
+failure_notification:
+  stage: notification
+  before_script:
+    - apk add --no-cache --upgrade bash
+    - apk add --update git curl
+  image: alpine:latest
+  script:
+    - wget https://raw.githubusercontent.com/DiscordHooks/gitlab-ci-discord-webhook/master/send.sh
+    - chmod +x send.sh
+    - ls
+    - ./send.sh failure $WEBHOOK_URL
+  when: on_failure
